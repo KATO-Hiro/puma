@@ -102,7 +102,6 @@ module TestSkips
         when :darwin   then "Skipped on darwin#{suffix}"    if RUBY_PLATFORM[/darwin/]
         when :jruby    then "Skipped on JRuby#{suffix}"     if Puma.jruby?
         when :windows  then "Skipped on Windows#{suffix}"   if Puma.windows?
-        when :appveyor then "Skipped on Appveyor#{suffix}"  if ENV["APPVEYOR"]
         when :ci       then "Skipped on ENV['CI']#{suffix}" if ENV["CI"]
         else false
       end
