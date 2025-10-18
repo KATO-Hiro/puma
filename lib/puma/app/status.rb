@@ -1,5 +1,5 @@
 # frozen_string_literal: true
-require 'puma/json_serialization'
+require_relative '../json_serialization'
 
 module Puma
   module App
@@ -7,13 +7,16 @@ module Puma
     # can respond to.
     class Status
       OK_STATUS = '{ "status": "ok" }'.freeze
+      READ_ONLY_COMMANDS = %w[gc-stats stats].freeze
 
       # @param launcher [::Puma::Launcher]
       # @param token [String, nil] the token used for authentication
+      # @param data_only [Boolean] if true, restrict to read-only data commands
       #
-      def initialize(launcher, token = nil)
+      def initialize(launcher, token: nil, data_only: false)
         @launcher = launcher
         @auth_token = token
+        @enabled_commands = READ_ONLY_COMMANDS if data_only
       end
 
       # most commands call methods in `::Puma::Launcher` based on command in
@@ -25,8 +28,13 @@ module Puma
 
         # resp_type is processed by following case statement, return
         # is a number (status) or a string used as the body of a 200 response
+        command = env['PATH_INFO'][/\/([^\/]+)$/, 1]
+        if @enabled_commands && !@enabled_commands.include?(command)
+          return rack_response(404, "Command #{command.inspect} unavailable", 'text/plain')
+        end
+
         resp_type =
-          case env['PATH_INFO'][/\/([^\/]+)$/, 1]
+          case command
           when 'stop'
             @launcher.stop ; 200
 
@@ -38,6 +46,9 @@ module Puma
 
           when 'phased-restart'
             @launcher.phased_restart ? 200 : 404
+
+          when 'refork'
+            @launcher.refork ? 200 : 404
 
           when 'reload-worker-directory'
             @launcher.send(:reload_worker_directory) ? 200 : 404
@@ -77,13 +88,13 @@ module Puma
 
       def authenticate(env)
         return true unless @auth_token
-        env['QUERY_STRING'].to_s.split(/&;/).include?("token=#{@auth_token}")
+        env['QUERY_STRING'].to_s.split(/[&;]/).include? "token=#{@auth_token}"
       end
 
       def rack_response(status, body, content_type='application/json')
         headers = {
-          'Content-Type' => content_type,
-          'Content-Length' => body.bytesize.to_s
+          'content-type' => content_type,
+          'content-length' => body.bytesize.to_s
         }
 
         [status, headers, [body]]

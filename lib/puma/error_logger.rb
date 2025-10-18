@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require 'puma/const'
+require_relative 'const'
 
 module Puma
   # The implementation of a detailed error logging.
@@ -13,14 +13,16 @@ module Puma
 
     REQUEST_FORMAT = %{"%s %s%s" - (%s)}
 
-    def initialize(ioerr)
+    LOG_QUEUE = Queue.new
+
+    def initialize(ioerr, env: ENV)
       @ioerr = ioerr
 
-      @debug = ENV.key? 'PUMA_DEBUG'
+      @debug = env.key?('PUMA_DEBUG')
     end
 
-    def self.stdio
-      new $stderr
+    def self.stdio(env: ENV)
+      new($stderr, env: env)
     end
 
     # Print occurred error details.
@@ -31,7 +33,7 @@ module Puma
     #   and before all remaining info.
     #
     def info(options={})
-      log title(options)
+      internal_write title(options)
     end
 
     # Print occurred error details only if
@@ -53,7 +55,7 @@ module Puma
       string_block << request_dump(req) if request_parsed?(req)
       string_block << error.backtrace if error
 
-      log string_block.join("\n")
+      internal_write string_block.join("\n")
     end
 
     def title(options={})
@@ -76,10 +78,12 @@ module Puma
     def request_title(req)
       env = req.env
 
+      query_string = env[QUERY_STRING]
+
       REQUEST_FORMAT % [
         env[REQUEST_METHOD],
         env[REQUEST_PATH] || env[PATH_INFO],
-        env[QUERY_STRING] || "",
+        query_string.nil? || query_string.empty? ? "" : "?#{query_string}",
         env[HTTP_X_FORWARDED_FOR] || env[REMOTE_ADDR] || "-"
       ]
     end
@@ -93,12 +97,19 @@ module Puma
       req && req.env[REQUEST_METHOD]
     end
 
-    private
-
-    def log(str)
-      ioerr.puts str
-
-      ioerr.flush unless ioerr.sync
+    def internal_write(str)
+      LOG_QUEUE << str
+      while (w_str = LOG_QUEUE.pop(true)) do
+        begin
+          @ioerr.is_a?(IO) and @ioerr.wait_writable(1)
+          @ioerr.write "#{w_str}\n"
+          @ioerr.flush unless @ioerr.sync
+        rescue Errno::EPIPE, Errno::EBADF, IOError, Errno::EINVAL
+        # 'Invalid argument' (Errno::EINVAL) may be raised by flush
+        end
+      end
+    rescue ThreadError
     end
+    private :internal_write
   end
 end

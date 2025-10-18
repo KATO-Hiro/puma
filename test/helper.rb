@@ -2,14 +2,16 @@
 # Copyright (c) 2011 Evan Phoenix
 # Copyright (c) 2005 Zed A. Shaw
 
-if %w(2.2.7 2.2.8 2.2.9 2.2.10 2.3.4 2.4.1).include? RUBY_VERSION
-  begin
-    require 'stopgap_13632'
-  rescue LoadError
-    puts "For test stability, you must install the stopgap_13632 gem."
-    exit(1)
-  end
+# WIth GitHub Actions, OS's `/tmp` folder may be on a HDD, while
+# ENV['RUNNER_TEMP'] is an SSD.  Faster.
+if ENV['GITHUB_ACTIONS'] == 'true'
+  ENV['TMPDIR'] = ENV['RUNNER_TEMP']
 end
+
+require "securerandom"
+
+# needs to be loaded before minitest for Ruby 2.7 and earlier
+require_relative "helpers/test_puma/assertions"
 
 require_relative "minitest/verbose"
 require "minitest/autorun"
@@ -21,21 +23,29 @@ require_relative "helpers/apps"
 
 Thread.abort_on_exception = true
 
-$debugging_info = ''.dup
-$debugging_hold = false    # needed for TestCLI#test_control_clustered
+$debugging_info = []
 
 require "puma"
 require "puma/detect"
 
+unless ::Puma::HAS_NATIVE_IO_WAIT
+  require "io/wait"
+end
+
 # used in various ssl test files, see test_puma_server_ssl.rb and
 # test_puma_localhost_authority.rb
 if Puma::HAS_SSL
-  require "puma/events"
-  class SSLEventsHelper < ::Puma::Events
-    attr_accessor :addr, :cert, :error
+  require 'puma/log_writer'
+  class SSLLogWriterHelper < ::Puma::LogWriter
+    attr_accessor :addr, :cert
+    attr_reader :errors
+
+    def error
+      @errors&.last
+    end
 
     def ssl_error(error, ssl_socket)
-      self.error = error
+      (@errors ||= []) << error
       self.addr = ssl_socket.peeraddr.last rescue "<unknown>"
       self.cert = ssl_socket.peercert
     end
@@ -60,54 +70,82 @@ def hit(uris)
 end
 
 module UniquePort
-  def self.call
-    TCPServer.open('127.0.0.1', 0) do |server|
+  def self.call(host = '127.0.0.1')
+    TCPServer.open(host, 0) do |server|
       server.connect_address.ip_port
     end
   end
 end
 
 require "timeout"
-module TimeoutEveryTestCase
-  # our own subclass so we never confused different timeouts
+
+module TimeoutPrepend
+  TEST_CASE_TIMEOUT = ENV.fetch("TEST_CASE_TIMEOUT") do
+    RUBY_ENGINE == "ruby" ? 45 : 60
+  end.to_i
+
+  # our own subclass so we never confuse different timeouts
   class TestTookTooLong < Timeout::Error
   end
 
-  def run
-    with_info_handler do
-      time_it do
-        capture_exceptions do
-          ::Timeout.timeout(RUBY_ENGINE == 'ruby' ? 45 : 60, TestTookTooLong) do
-            before_setup; setup; after_setup
-            self.send self.name
-          end
-        end
-
-        capture_exceptions do
-          ::Timeout.timeout(RUBY_ENGINE == 'ruby' ? 45 : 60, TestTookTooLong) do
-            Minitest::Test::TEARDOWN_METHODS.each { |hook| self.send hook }
-          end
-        end
-        if respond_to? :clean_tmp_paths
-          clean_tmp_paths
-        end
-      end
+  def capture_exceptions
+    super do
+      ::Timeout.timeout(TEST_CASE_TIMEOUT, TestTookTooLong) { yield }
     end
-
-    Minitest::Result.from self # per contract
   end
 end
 
-Minitest::Test.prepend TimeoutEveryTestCase
+Minitest::Test.prepend TimeoutPrepend
+
+class PumaTest < Minitest::Test # rubocop:disable Puma/TestsMustUsePumaTest
+  def teardown
+    clean_tmp_paths if respond_to? :clean_tmp_paths
+  end
+end
+
 if ENV['CI']
   require 'minitest/retry'
+
+  Minitest::Retry::GHA_STEP_SUMMARY_FILE = ENV['GITHUB_STEP_SUMMARY']
+
   Minitest::Retry.use!
+
+  if Minitest::Retry::GHA_STEP_SUMMARY_FILE && ENV['GITHUB_ACTIONS'] == 'true'
+
+    Minitest::Retry::GHA_STEP_SUMMARY_MUTEX = Mutex.new
+
+    Minitest::Retry.on_failure do |klass, test_name, result|
+      full_method = "#{klass}##{test_name}"
+      result_str = result.to_s.gsub(/#{full_method}:?\s*/, '').dup
+      result_str.gsub!(/\A(Failure:|Error:)\s/, '\1 ')
+      issue = result_str[/\A[^\n]+/]
+      result_str.gsub!(issue, '')
+      # shorten directory lists
+      result_str.gsub! ENV['GITHUB_WORKSPACE'], 'puma'
+      result_str.gsub! ENV['RUNNER_TOOL_CACHE'], ''
+      # remove indent
+      result_str.gsub!(/^ +/, '')
+      str = "\n**#{full_method}**\n**#{issue}**\n```\n#{result_str.strip}\n```\n"
+      Minitest::Retry::GHA_STEP_SUMMARY_MUTEX.synchronize {
+        retry_cntr = 0
+        begin
+          File.write Minitest::Retry::GHA_STEP_SUMMARY_FILE, str, mode: 'a+'
+        rescue IOError # can't write to file, retry once
+          if retry_cntr == 0
+            retry_cntr += 1
+            sleep 0.2
+            retry
+          end
+        end
+      }
+    end
+  end
 end
 
 module TestSkips
 
   HAS_FORK = ::Process.respond_to? :fork
-  UNIX_SKT_EXIST = Object.const_defined? :UNIXSocket
+  UNIX_SKT_EXIST = Object.const_defined?(:UNIXSocket) && !Puma::IS_WINDOWS
 
   MSG_FORK = "Kernel.fork isn't available on #{RUBY_ENGINE} on #{RUBY_PLATFORM}"
   MSG_UNIX = "UNIXSockets aren't available on the #{RUBY_PLATFORM} platform"
@@ -115,15 +153,16 @@ module TestSkips
 
   SIGNAL_LIST = Signal.list.keys.map(&:to_sym) - (Puma.windows? ? [:INT, :TERM] : [])
 
-  JRUBY_HEAD = Puma::IS_JRUBY && RUBY_DESCRIPTION =~ /SNAPSHOT/
+  JRUBY_HEAD = Puma::IS_JRUBY && RUBY_DESCRIPTION.include?('SNAPSHOT')
 
   DARWIN = RUBY_PLATFORM.include? 'darwin'
 
   TRUFFLE = RUBY_ENGINE == 'truffleruby'
+  TRUFFLE_HEAD = TRUFFLE && RUBY_DESCRIPTION.include?('-dev-')
 
   # usage: skip_unless_signal_exist? :USR2
   def skip_unless_signal_exist?(sig, bt: caller)
-    signal = sig.to_s.sub(/\ASIG/, '').to_sym
+    signal = sig.to_s.delete_prefix('SIG').to_sym
     unless SIGNAL_LIST.include? signal
       skip "Signal #{signal} isn't available on the #{RUBY_PLATFORM} platform", bt
     end
@@ -135,6 +174,7 @@ module TestSkips
   def skip_if(*engs, suffix: '', bt: caller)
     engs.each do |eng|
       skip_msg = case eng
+        when :linux       then "Skipped if Linux#{suffix}"       if Puma::IS_LINUX
         when :darwin      then "Skipped if darwin#{suffix}"      if Puma::IS_OSX
         when :jruby       then "Skipped if JRuby#{suffix}"       if Puma::IS_JRUBY
         when :truffleruby then "Skipped if TruffleRuby#{suffix}" if TRUFFLE
@@ -145,6 +185,8 @@ module TestSkips
         when :fork        then "Skipped if Kernel.fork exists"   if HAS_FORK
         when :unix        then "Skipped if UNIXSocket exists"    if Puma::HAS_UNIX_SOCKET
         when :aunix       then "Skipped if abstract UNIXSocket"  if Puma.abstract_unix_socket?
+        when :rack3       then "Skipped if Rack 3.x"             if Rack.release >= '3'
+        when :oldwindows  then "Skipped if old Windows"          if Puma::IS_WINDOWS && RUBY_VERSION < '2.6'
         else false
       end
       skip skip_msg, bt if skip_msg
@@ -154,6 +196,7 @@ module TestSkips
   # called with only one param
   def skip_unless(eng, bt: caller)
     skip_msg = case eng
+      when :linux   then "Skip unless Linux"            unless Puma::IS_LINUX
       when :darwin  then "Skip unless darwin"           unless Puma::IS_OSX
       when :jruby   then "Skip unless JRuby"            unless Puma::IS_JRUBY
       when :windows then "Skip unless Windows"          unless Puma::IS_WINDOWS
@@ -162,6 +205,7 @@ module TestSkips
       when :fork    then MSG_FORK                       unless HAS_FORK
       when :unix    then MSG_UNIX                       unless Puma::HAS_UNIX_SOCKET
       when :aunix   then MSG_AUNIX                      unless Puma.abstract_unix_socket?
+      when :rack3   then "Skipped unless Rack >= 3.x"   unless ::Rack.release >= '3'
       else false
     end
     skip skip_msg, bt if skip_msg
@@ -171,6 +215,9 @@ end
 Minitest::Test.include TestSkips
 
 class Minitest::Test
+
+  PROJECT_ROOT = File.dirname(__dir__)
+
   def self.run(reporter, options = {}) # :nodoc:
     prove_it!
     super
@@ -182,9 +229,9 @@ class Minitest::Test
 end
 
 Minitest.after_run do
-  # needed for TestCLI#test_control_clustered
-  unless $debugging_hold
-    out = $debugging_info.strip
+  if ENV['PUMA_TEST_DEBUG']
+    $debugging_info.sort!
+    out = $debugging_info.join.strip
     unless out.empty?
       dash = "\u2500"
       wid = ENV['GITHUB_ACTIONS'] ? 88 : 90
@@ -200,13 +247,18 @@ end
 
 module AggregatedResults
   def aggregated_results(io)
+    is_github_actions = ENV['GITHUB_ACTIONS'] == 'true'
     filtered_results = results.dup
 
     if options[:verbose]
       skips = filtered_results.select(&:skipped?)
       unless skips.empty?
         dash = "\u2500"
-        io.puts '', "Skips:"
+        if is_github_actions
+          puts "", "##[group]Skips:"
+        else
+          io.puts '', 'Skips:'
+        end
         hsh = skips.group_by { |f| f.failures.first.error.message }
         hsh_s = {}
         hsh.each { |k, ary|
@@ -228,6 +280,7 @@ module AggregatedResults
             puts ''
           }
         }
+        puts '::[endgroup]' if is_github_actions
       end
     end
 
@@ -243,3 +296,48 @@ module AggregatedResults
   end
 end
 Minitest::SummaryReporter.prepend AggregatedResults
+
+module TestTempFile
+  require "tempfile"
+  def tempfile_create(basename, data, mode: File::BINARY)
+    fio = Tempfile.create(basename, mode: mode)
+    fio.write data
+    fio.flush
+    fio.rewind
+    @ios << fio if defined?(@ios)
+    @ios_to_close << fio if defined?(@ios_to_close)
+    fio
+  end
+end
+Minitest::Test.include TestTempFile
+
+# This module is modified based on https://github.com/rails/rails/blob/7-1-stable/activesupport/lib/active_support/testing/method_call_assertions.rb
+module MethodCallAssertions
+  def assert_called_on_instance_of(klass, method_name, message = nil, times: 1, returns: nil)
+    times_called = 0
+    klass.send(:define_method, :"stubbed_#{method_name}") do |*|
+      times_called += 1
+
+      returns
+    end
+
+    klass.send(:alias_method, :"original_#{method_name}", method_name)
+    klass.send(:alias_method, method_name, :"stubbed_#{method_name}")
+
+    yield
+
+    error = "Expected #{method_name} to be called #{times} times, but was called #{times_called} times"
+    error = "#{message}.\n#{error}" if message
+
+    assert_equal times, times_called, error
+  ensure
+    klass.send(:alias_method, method_name, :"original_#{method_name}")
+    klass.send(:undef_method, :"original_#{method_name}")
+    klass.send(:undef_method, :"stubbed_#{method_name}")
+  end
+
+  def assert_not_called_on_instance_of(klass, method_name, message = nil, &block)
+    assert_called_on_instance_of(klass, method_name, message, times: 0, &block)
+  end
+end
+Minitest::Test.include MethodCallAssertions

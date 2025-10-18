@@ -1,7 +1,8 @@
-require_relative "helper"
-require "puma/events"
+# frozen_string_literal: true
 
-class TestOutOfBandServer < Minitest::Test
+require_relative "helper"
+
+class TestOutOfBandServer < PumaTest
   parallelize_me!
 
   def setup
@@ -14,14 +15,21 @@ class TestOutOfBandServer < Minitest::Test
   def teardown
     @oob_finished.broadcast
     @app_finished.broadcast
-    @server.stop(true) if @server
-    @ios.each {|i| i.close unless i.closed?}
+    @server&.stop true
+
+    @ios.each do |io|
+      begin
+        io.close if io.is_a?(IO) && !io.closed?
+      rescue
+      ensure
+        io = nil
+      end
+    end
   end
 
   def new_connection
     TCPSocket.new('127.0.0.1', @port).tap {|s| @ios << s}
   rescue IOError
-    Puma::Util.purge_interrupt_queue
     retry
   end
 
@@ -39,15 +47,17 @@ class TestOutOfBandServer < Minitest::Test
     in_oob = Mutex.new
     @mutex = Mutex.new
     oob_wait = options.delete(:oob_wait)
-    oob = -> do
-      in_oob.synchronize do
-        @mutex.synchronize do
-          @oob_count += 1
-          @oob_finished.signal
-          @oob_finished.wait(@mutex, 1) if oob_wait
+    oob = {
+      block: -> do
+        in_oob.synchronize do
+          @mutex.synchronize do
+            @oob_count += 1
+            @oob_finished.signal
+            @oob_finished.wait(@mutex, 1) if oob_wait
+          end
         end
       end
-    end
+    }
     app_wait = options.delete(:app_wait)
     app = ->(_) do
       raise 'OOB conflict' if in_oob.locked?
@@ -59,9 +69,11 @@ class TestOutOfBandServer < Minitest::Test
       [200, {}, [""]]
     end
 
-    @server = Puma::Server.new app, Puma::Events.strings, out_of_band: [oob], **options
-    @server.min_threads = options[:min_threads] || 1
-    @server.max_threads = options[:max_threads] || 1
+    options[:min_threads] ||= 1
+    options[:max_threads] ||= 1
+    options[:log_writer]  ||= Puma::LogWriter.strings
+
+    @server = Puma::Server.new app, nil, out_of_band: [oob], **options
     @port = (@server.add_tcp_listener '127.0.0.1', 0).addr[1]
     @server.run
     sleep 0.15 if Puma.jruby?

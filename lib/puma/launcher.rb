@@ -1,11 +1,12 @@
 # frozen_string_literal: true
 
-require 'puma/events'
-require 'puma/detect'
-require 'puma/cluster'
-require 'puma/single'
-require 'puma/const'
-require 'puma/binder'
+require_relative 'log_writer'
+require_relative 'events'
+require_relative 'detect'
+require_relative 'cluster'
+require_relative 'single'
+require_relative 'const'
+require_relative 'binder'
 
 module Puma
   # Puma::Launcher is the single entry point for starting a Puma server based on user
@@ -15,21 +16,21 @@ module Puma
   # It is responsible for either launching a cluster of Puma workers or a single
   # puma server.
   class Launcher
-    KEYS_NOT_TO_PERSIST_IN_STATE = [
-       :logger, :lowlevel_error_handler,
-       :before_worker_shutdown, :before_worker_boot, :before_worker_fork,
-       :after_worker_boot, :before_fork, :on_restart
-     ]
+    autoload :BundlePruner, 'puma/launcher/bundle_pruner'
+
     # Returns an instance of Launcher
     #
     # +conf+ A Puma::Configuration object indicating how to run the server.
     #
-    # +launcher_args+ A Hash that currently has one required key `:events`,
-    # this is expected to hold an object similar to an `Puma::Events.stdio`,
-    # this object will be responsible for broadcasting Puma's internal state
-    # to a logging destination. An optional key `:argv` can be supplied,
-    # this should be an array of strings, these arguments are re-used when
-    # restarting the puma server.
+    # +launcher_args+ A Hash that has a few optional keys.
+    # - +:log_writer+:: Expected to hold an object similar to `Puma::LogWriter.stdio`.
+    #   This object will be responsible for broadcasting Puma's internal state
+    #   to a logging destination.
+    # - +:events+:: Expected to hold an object similar to `Puma::Events`.
+    # - +:argv+:: Expected to be an array of strings.
+    # - +:env+:: Expected to hold a hash of environment variables.
+    #
+    # These arguments are re-used when restarting the puma server.
     #
     # Examples:
     #
@@ -39,66 +40,78 @@ module Puma
     #       [200, {}, ["hello world"]]
     #     end
     #   end
-    #   Puma::Launcher.new(conf, events: Puma::Events.stdio).run
+    #   Puma::Launcher.new(conf, log_writer: Puma::LogWriter.stdio).run
     def initialize(conf, launcher_args={})
-      @runner        = nil
-      @events        = launcher_args[:events] || Events::DEFAULT
-      @argv          = launcher_args[:argv] || []
+      ## Minimal initialization for a potential early restart (e.g. when pruning bundle)
+
+      @config = conf
+      @config.clamp
+
+      @options = @config.options
+
+      @log_writer = launcher_args[:log_writer] || LogWriter::DEFAULT
+      @log_writer.formatter = LogWriter::PidFormatter.new if clustered?
+      @log_writer.formatter = @options[:log_formatter] if @options[:log_formatter]
+      @log_writer.custom_logger = @options[:custom_logger] if @options[:custom_logger]
+      @options[:log_writer] = @log_writer
+      @options[:logger] = @log_writer if clustered?
+
+      @events = launcher_args[:events] || Events.new
+
+      @argv = launcher_args[:argv] || []
       @original_argv = @argv.dup
-      @config        = conf
 
-      @binder        = Binder.new(@events, conf)
-      @binder.create_inherited_fds(ENV).each { |k| ENV.delete k }
-      @binder.create_activated_fds(ENV).each { |k| ENV.delete k }
+      ## End minimal initialization
 
-      @environment = conf.environment
+      generate_restart_data
+      Dir.chdir(@restart_dir)
+
+      prune_bundler!
+
+      env = launcher_args.delete(:env) || ENV
 
       # Advertise the Configuration
       Puma.cli_config = @config if defined?(Puma.cli_config)
+      log_config if env['PUMA_LOG_CONFIG']
 
-      @config.load
+      @binder = Binder.new(@log_writer, @options)
+      @binder.create_inherited_fds(env).each { |k| env.delete k }
+      @binder.create_activated_fds(env).each { |k| env.delete k }
 
-      if @config.options[:bind_to_activated_sockets]
-        @config.options[:binds] = @binder.synthesize_binds_from_activated_fs(
-          @config.options[:binds],
-          @config.options[:bind_to_activated_sockets] == 'only'
+      @environment = @config.environment
+
+      # Load the systemd integration if we detect systemd's NOTIFY_SOCKET.
+      # Skip this on JRuby though, because it is incompatible with the systemd
+      # integration due to https://github.com/jruby/jruby/issues/6504
+      if ENV["NOTIFY_SOCKET"] && !Puma.jruby? && !ENV["PUMA_SKIP_SYSTEMD"]
+        @config.plugins.create('systemd')
+      end
+
+      if @options[:bind_to_activated_sockets]
+        @options[:binds] = @binder.synthesize_binds_from_activated_fs(
+          @options[:binds],
+          @options[:bind_to_activated_sockets] == 'only'
         )
       end
 
-      @options = @config.options
-      @config.clamp
-
-      @events.formatter = Events::PidFormatter.new if clustered?
-      @events.formatter = options[:log_formatter] if @options[:log_formatter]
-
-      generate_restart_data
-
-      if clustered? && !Process.respond_to?(:fork)
+      if clustered? && !Puma.forkable?
         unsupported "worker mode not supported on #{RUBY_ENGINE} on this platform"
       end
-
-      Dir.chdir(@restart_dir)
-
-      prune_bundler if prune_bundler?
 
       @environment = @options[:environment] if @options[:environment]
       set_rack_environment
 
       if clustered?
-        @options[:logger] = @events
-
-        @runner = Cluster.new(self, @events)
+        @runner = Cluster.new(self)
       else
-        @runner = Single.new(self, @events)
+        @runner = Single.new(self)
       end
       Puma.stats_object = @runner
 
       @status = :run
-
-      log_config if ENV['PUMA_LOG_CONFIG']
     end
 
-    attr_reader :binder, :events, :config, :options, :restart_dir
+    attr_reader :binder, :log_writer, :events, :config, :options, :restart_dir
 
     # Return stats about the server
     def stats
@@ -114,7 +127,7 @@ module Puma
       permission = @options[:state_permission]
       return unless path
 
-      require 'puma/state_file'
+      require_relative 'state_file'
 
       sf = StateFile.new
       sf.pid = Process.pid
@@ -128,7 +141,10 @@ module Puma
     # Delete the configured pidfile
     def delete_pidfile
       path = @options[:pidfile]
-      File.unlink(path) if path && File.exist?(path)
+      begin
+        File.unlink(path) if path
+      rescue Errno::ENOENT
+      end
     end
 
     # Begin async shutdown of the server
@@ -155,21 +171,30 @@ module Puma
         log "* phased-restart called but not available, restarting normally."
         return restart
       end
+
+      if @options.file_options[:tag].nil?
+        dir = File.realdirpath(@restart_dir)
+        @options[:tag] = File.basename(dir)
+        set_process_title
+      end
+
       true
+    end
+
+    # Begin a refork if supported
+    def refork
+      if clustered? && @runner.respond_to?(:fork_worker!) && @options[:fork_worker]
+        @runner.fork_worker!
+        true
+      else
+        log "* refork called but not available."
+        false
+      end
     end
 
     # Run the server. This blocks until the server is stopped
     def run
-      previous_env =
-        if defined?(Bundler)
-          env = Bundler::ORIGINAL_ENV.dup
-          # add -rbundler/setup so we load from Gemfile when restarting
-          bundle = "-rbundler/setup"
-          env["RUBYOPT"] = [env["RUBYOPT"], bundle].join(" ").lstrip unless env["RUBYOPT"].to_s.include?(bundle)
-          env
-        else
-          ENV.to_h
-        end
+      previous_env = get_env
 
       @config.clamp
 
@@ -177,24 +202,11 @@ module Puma
 
       setup_signals
       set_process_title
-      integrate_with_systemd
+
+      # This blocks until the server is stopped
       @runner.run
 
-      case @status
-      when :halt
-        log "* Stopping immediately!"
-        @runner.stop_control
-      when :run, :stop
-        graceful_stop
-      when :restart
-        log "* Restarting..."
-        ENV.replace(previous_env)
-        @runner.stop_control
-        restart!
-      when :exit
-        # nothing
-      end
-      close_binder_listeners unless @status == :restart
+      do_run_finished(previous_env)
     end
 
     # Return all tcp ports the launcher may be using, TCP or SSL
@@ -238,6 +250,74 @@ module Puma
 
     private
 
+    def get_env
+      if defined?(Bundler)
+        env = Bundler::ORIGINAL_ENV.dup
+        # add -rbundler/setup so we load from Gemfile when restarting
+        bundle = "-rbundler/setup"
+        env["RUBYOPT"] = [env["RUBYOPT"], bundle].join(" ").lstrip unless env["RUBYOPT"].to_s.include?(bundle)
+        env
+      else
+        ENV.to_h
+      end
+    end
+
+    def do_run_finished(previous_env)
+      case @status
+      when :halt
+        do_forceful_stop
+      when :run, :stop
+        do_graceful_stop
+      when :restart
+        do_restart(previous_env)
+      end
+
+      close_binder_listeners unless @status == :restart
+    end
+
+    def do_forceful_stop
+      log "* Stopping immediately!"
+      @runner.stop_control
+    end
+
+    def do_graceful_stop
+      @events.fire_after_stopped!
+      @runner.stop_blocked
+    end
+
+    def do_restart(previous_env)
+      log "* Restarting..."
+      ENV.replace(previous_env)
+      @runner.stop_control
+      restart!
+    end
+
+    def restart!
+      @events.fire_before_restart!
+      @config.run_hooks :before_restart, self, @log_writer
+
+      if Puma.jruby?
+        close_binder_listeners
+
+        require_relative 'jruby_restart'
+        argv = restart_args
+        JRubyRestart.chdir(@restart_dir)
+        Kernel.exec(*argv)
+      elsif Puma.windows?
+        close_binder_listeners
+
+        argv = restart_args
+        Dir.chdir(@restart_dir)
+        Kernel.exec(*argv)
+      else
+        argv = restart_args
+        Dir.chdir(@restart_dir)
+        ENV.update(@binder.redirects_for_restart_env)
+        argv += [@binder.redirects_for_restart]
+        Kernel.exec(*argv)
+      end
+    end
+
     # If configured, write the pid of the current process out
     # to a file.
     def write_pid
@@ -254,118 +334,8 @@ module Puma
       @runner.reload_worker_directory if @runner.respond_to?(:reload_worker_directory)
     end
 
-    def restart!
-      @events.fire_on_restart!
-      @config.run_hooks :on_restart, self, @events
-
-      if Puma.jruby?
-        close_binder_listeners
-
-        require 'puma/jruby_restart'
-        JRubyRestart.chdir_exec(@restart_dir, restart_args)
-      elsif Puma.windows?
-        close_binder_listeners
-
-        argv = restart_args
-        Dir.chdir(@restart_dir)
-        Kernel.exec(*argv)
-      else
-        argv = restart_args
-        Dir.chdir(@restart_dir)
-        ENV.update(@binder.redirects_for_restart_env)
-        argv += [@binder.redirects_for_restart]
-        Kernel.exec(*argv)
-      end
-    end
-
-    # @!attribute [r] files_to_require_after_prune
-    def files_to_require_after_prune
-      puma = spec_for_gem("puma")
-
-      require_paths_for_gem(puma) + extra_runtime_deps_directories
-    end
-
-    # @!attribute [r] extra_runtime_deps_directories
-    def extra_runtime_deps_directories
-      Array(@options[:extra_runtime_dependencies]).map do |d_name|
-        if (spec = spec_for_gem(d_name))
-          require_paths_for_gem(spec)
-        else
-          log "* Could not load extra dependency: #{d_name}"
-          nil
-        end
-      end.flatten.compact
-    end
-
-    # @!attribute [r] puma_wild_location
-    def puma_wild_location
-      puma = spec_for_gem("puma")
-      dirs = require_paths_for_gem(puma)
-      puma_lib_dir = dirs.detect { |x| File.exist? File.join(x, '../bin/puma-wild') }
-      File.expand_path(File.join(puma_lib_dir, "../bin/puma-wild"))
-    end
-
-    def prune_bundler
-      return if ENV['PUMA_BUNDLER_PRUNED']
-      return unless defined?(Bundler)
-      require_rubygems_min_version!(Gem::Version.new("2.2"), "prune_bundler")
-      unless puma_wild_location
-        log "! Unable to prune Bundler environment, continuing"
-        return
-      end
-
-      dirs = files_to_require_after_prune
-
-      log '* Pruning Bundler environment'
-      home = ENV['GEM_HOME']
-      bundle_gemfile = Bundler.original_env['BUNDLE_GEMFILE']
-      bundle_app_config = Bundler.original_env['BUNDLE_APP_CONFIG']
-      with_unbundled_env do
-        ENV['GEM_HOME'] = home
-        ENV['BUNDLE_GEMFILE'] = bundle_gemfile
-        ENV['PUMA_BUNDLER_PRUNED'] = '1'
-        ENV["BUNDLE_APP_CONFIG"] = bundle_app_config
-        args = [Gem.ruby, puma_wild_location, '-I', dirs.join(':')] + @original_argv
-        # Ruby 2.0+ defaults to true which breaks socket activation
-        args += [{:close_others => false}]
-        Kernel.exec(*args)
-      end
-    end
-
-    #
-    # Puma's systemd integration allows Puma to inform systemd:
-    #  1. when it has successfully started
-    #  2. when it is starting shutdown
-    #  3. periodically for a liveness check with a watchdog thread
-    #
-
-    def integrate_with_systemd
-      return unless ENV["NOTIFY_SOCKET"]
-
-      begin
-        require 'puma/systemd'
-      rescue LoadError
-        log "Systemd integration failed. It looks like you're trying to use systemd notify but don't have sd_notify gem installed"
-        return
-      end
-
-      log "* Enabling systemd notification integration"
-
-      systemd = Systemd.new(@events)
-      systemd.hook_events
-      systemd.start_watchdog
-    end
-
-    def spec_for_gem(gem_name)
-      Bundler.rubygems.loaded_specs(gem_name)
-    end
-
-    def require_paths_for_gem(gem_spec)
-      gem_spec.full_require_paths
-    end
-
     def log(str)
-      @events.log str
+      @log_writer.log(str)
     end
 
     def clustered?
@@ -373,13 +343,8 @@ module Puma
     end
 
     def unsupported(str)
-      @events.error(str)
+      @log_writer.error(str)
       raise UnsupportedOption
-    end
-
-    def graceful_stop
-      @events.fire_on_stopped!
-      @runner.stop_blocked
     end
 
     def set_process_title
@@ -407,6 +372,11 @@ module Puma
       @options[:prune_bundler] && clustered? && !@options[:preload_app]
     end
 
+    def prune_bundler!
+      return unless prune_bundler?
+      BundlePruner.new(@original_argv, @options[:extra_runtime_dependencies], @log_writer).prune
+    end
+
     def generate_restart_data
       if dir = @options[:directory]
         @restart_dir = dir
@@ -416,9 +386,9 @@ module Puma
         # using it.
         @restart_dir = Dir.pwd
 
-        # Use the same trick as unicorn, namely favor PWD because
-        # it will contain an unresolved symlink, useful for when
-        # the pwd is /data/releases/current.
+      # Use the same trick as unicorn, namely favor PWD because
+      # it will contain an unresolved symlink, useful for when
+      # the pwd is /data/releases/current.
       elsif dir = ENV['PWD']
         s_env = File.stat(dir)
         s_pwd = File.stat(Dir.pwd)
@@ -453,12 +423,14 @@ module Puma
     end
 
     def setup_signals
-      begin
-        Signal.trap "SIGUSR2" do
-          restart
+      unless ENV["PUMA_SKIP_SIGUSR2"]
+        begin
+          Signal.trap "SIGUSR2" do
+            restart
+          end
+        rescue Exception
+          log "*** SIGUSR2 not implemented, signal based restart unavailable!"
         end
-      rescue Exception
-        log "*** SIGUSR2 not implemented, signal based restart unavailable!"
       end
 
       unless Puma.jruby?
@@ -473,7 +445,8 @@ module Puma
 
       begin
         Signal.trap "SIGTERM" do
-          graceful_stop
+          # Shortcut the control flow in case raise_exception_on_sigterm is true
+          do_graceful_stop
 
           raise(SignalException, "SIGTERM") if @options[:raise_exception_on_sigterm]
         end
@@ -505,31 +478,14 @@ module Puma
         unless Puma.jruby? # INFO in use by JVM already
           Signal.trap "SIGINFO" do
             thread_status do |name, backtrace|
-              @events.log name
-              @events.log backtrace.map { |bt| "  #{bt}" }
+              @log_writer.log(name)
+              @log_writer.log(backtrace.map { |bt| "  #{bt}" })
             end
           end
         end
       rescue Exception
         # Not going to log this one, as SIGINFO is *BSD only and would be pretty annoying
         # to see this constantly on Linux.
-      end
-    end
-
-    def require_rubygems_min_version!(min_version, feature)
-      return if min_version <= Gem::Version.new(Gem::VERSION)
-
-      raise "#{feature} is not supported on your version of RubyGems. " \
-              "You must have RubyGems #{min_version}+ to use this feature."
-    end
-
-    # @version 5.0.0
-    def with_unbundled_env
-      bundler_ver = Gem::Version.new(Bundler::VERSION)
-      if bundler_ver < Gem::Version.new('2.1.0')
-        Bundler.with_clean_env { yield }
-      else
-        Bundler.with_unbundled_env { yield }
       end
     end
 

@@ -17,13 +17,13 @@ $ ps aux | grep tail
 schneems        87152   0.0  0.0  2432772    492 s032  S+   12:46PM   0:00.00 tail -f my.log
 ```
 
-You can send a signal in Ruby using the [Process module](https://www.ruby-doc.org/core-2.1.1/Process.html#kill-method):
+You can send a signal in Ruby using the [Process module](https://docs.ruby-lang.org/en/master/Process.html#method-c-kill):
 
 ```
 $ irb
 > puts pid
 => 87152
-Process.detach(pid) # https://ruby-doc.org/core-2.1.1/Process.html#method-c-detach
+Process.detach(pid) # https://docs.ruby-lang.org/en/master/Process.html#method-c-detach
 Process.kill("TERM", pid)
 ```
 
@@ -42,6 +42,7 @@ Puma cluster responds to these signals:
 - `INT ` equivalent of sending Ctrl-C to cluster. Puma will attempt to finish then exit.
 - `CHLD`
 - `URG ` refork workers in phases from worker 0 if `fork_workers` option is enabled.
+- `INFO` print backtraces of all puma threads
 
 ## Callbacks order in case of different signals
 
@@ -53,12 +54,12 @@ puma configuration file reloaded, if there is one
 puma configuration file reloaded, if there is one
 
 before_fork
-on_worker_fork
+before_worker_fork
 after_worker_fork
 
 Gemfile in context
 
-on_worker_boot
+before_worker_boot
 
 Code of the app is loaded and running
 ```
@@ -66,18 +67,18 @@ Code of the app is loaded and running
 ### Send USR2
 
 ```
-on_worker_shutdown
-on_restart
+before_worker_shutdown
+before_restart
 
 puma configuration file reloaded, if there is one
 
 before_fork
-on_worker_fork
+before_worker_fork
 after_worker_fork
 
 Gemfile in context
 
-on_worker_boot
+before_worker_boot
 
 Code of the app is loaded and running
 ```
@@ -85,13 +86,13 @@ Code of the app is loaded and running
 ### Send USR1
 
 ```
-on_worker_shutdown
-on_worker_fork
+before_worker_shutdown
+before_worker_fork
 after_worker_fork
 
 Gemfile in context
 
-on_worker_boot
+before_worker_boot
 
 Code of the app is loaded and running
 ```

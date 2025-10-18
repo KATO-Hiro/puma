@@ -1,8 +1,10 @@
+# frozen_string_literal: true
+
 require_relative "helper"
 
 require "puma/puma_http11"
 
-class Http10ParserTest < Minitest::Test
+class Http10ParserTest < PumaTest
   def test_parse_simple
     parser = Puma::HttpParser.new
     req = {}
@@ -15,7 +17,7 @@ class Http10ParserTest < Minitest::Test
     assert nread == parser.nread, "Number read returned from execute does not match"
 
     assert_equal '/', req['REQUEST_PATH']
-    assert_equal 'HTTP/1.0', req['HTTP_VERSION']
+    assert_equal 'HTTP/1.0', req['SERVER_PROTOCOL']
     assert_equal '/', req['REQUEST_URI']
     assert_equal 'GET', req['REQUEST_METHOD']
     assert_nil req['FRAGMENT']
